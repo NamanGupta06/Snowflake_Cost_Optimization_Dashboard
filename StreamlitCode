@@ -1,0 +1,95 @@
+# Import python packages
+import streamlit as st
+from snowflake.snowpark.context import get_active_session
+import matplotlib.pyplot as plt
+import pandas as pd
+from fpdf import FPDF
+import io
+
+
+# Write directly to the app
+st.title("Snowflake Cost Optimization Dashboard")
+st.write("Features")
+
+# Get the current credentials
+session = get_active_session()
+
+# Fetching warehouse cost data
+wh_cost_df = session.sql('''
+SELECT 
+        warehouse_name, 
+        SUM(credits_used) AS total_credits_used
+    FROM snowflake.account_usage.warehouse_metering_history
+    WHERE start_time >= DATEADD(DAY, -30, CURRENT_DATE)
+    GROUP BY warehouse_name
+    ORDER BY total_credits_used DESC
+''').to_pandas()
+
+# Fetch slow and expensive queries
+slow_query_df = session.sql('''SELECT 
+        query_id, 
+        warehouse_name, 
+        user_name, 
+        total_elapsed_time/1000 AS execution_time_seconds,
+        bytes_scanned/1024/1024 AS scanned_MB
+    FROM snowflake.account_usage.query_history
+    WHERE start_time >= DATEADD(DAY, -30, CURRENT_DATE)
+    ORDER BY execution_time_seconds DESC
+    LIMIT 20''').to_pandas()
+
+#Fetch unused Queries
+fetch_unused_df = session.sql('''SELECT table_schema, table_name, last_altered, row_count, bytes/1024/1024 AS size_MB
+    FROM snowflake.information_schema.tables
+    WHERE last_altered < DATEADD(DAY, -90, CURRENT_DATE)
+    ORDER BY size_MB DESC''').to_pandas()
+
+#Generating PDF
+def generate_pdf(wh_cost_df, slow_query_df, fetch_unused_df):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(200, 10, "Snowflake Cost Optimization Report", ln=True, align='C')
+    
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(200, 10, "Warehouse Credit Consumption", ln=True)
+    pdf.set_font("Arial", "", 10)
+    for index, row in wh_cost_df.iterrows():
+        pdf.cell(200, 8, f"{row['WAREHOUSE_NAME']}: {row['TOTAL_CREDITS_USED']} credits", ln=True)
+    
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(200, 10, "Slow & Expensive Queries", ln=True)
+    pdf.set_font("Arial", "", 10)
+    for index, row in slow_query_df.iterrows():
+        pdf.cell(200, 8, f"Query {row['QUERY_ID']} - {row['EXECUTION_TIME_SECONDS']}s, {row['SCANNED_MB']}MB", ln=True)
+    
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(200, 10, "Large Unused Tables", ln=True)
+    pdf.set_font("Arial", "", 10)
+    for index, row in fetch_unused_df.iterrows():
+        pdf.cell(200, 8, f"{row['TABLE_SCHEMA']}.{row['TABLE_NAME']} - {row['SIZE_MB']}MB", ln=True)
+    
+    pdf_output = io.BytesIO()
+    pdf_output.write(pdf.output(dest='S').encode('latin1'))  # Write PDF content to BytesIO
+    pdf_output.seek(0)  # Reset stream position
+    return pdf_output
+
+# Warehouse Cost Data
+st.header("Warehouse Credit Consumption")
+st.dataframe(wh_cost_df)
+fig, ax = plt.subplots()
+ax.bar(wh_cost_df["WAREHOUSE_NAME"], wh_cost_df["TOTAL_CREDITS_USED"])
+st.pyplot(fig)
+
+# Slow Queries Data
+st.header("Slow & Expensive Queries")
+st.dataframe(slow_query_df)
+
+# Unused Tables Data
+st.header("Large Unused Tables")
+st.dataframe(fetch_unused_df)
+
+st.header("Download Cost Optimization Report")
+if st.button("Generate Report"):
+    pdf_file = generate_pdf(wh_cost_df, slow_query_df, fetch_unused_df)
+    st.download_button(label="Download Report", data=pdf_file, file_name="Snowflake_Cost_Report.pdf", mime="application/pdf")
